@@ -1,0 +1,349 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#!/usr/bin/pudb3
+
+# A script to create a podman RHEL8 container to run gdb against RHEL8 userspace core
+
+# TODO
+# add extra dnf repositries
+
+
+import argparse
+import sys
+import time
+import subprocess
+import re
+import os
+import shutil
+import logging
+import stat
+from typing import NamedTuple
+
+
+os.environ["LANG"]="C"
+
+
+def my_name():
+    return os.path.basename(__file__)
+
+
+NOW = time.strftime("%Y-%m-%d-%H.%M.%S")
+THIS = my_name()
+WORKDIR = THIS + "-" + NOW
+CONTAINER_NAME = THIS + "-" + NOW
+PODMAN = "/usr/bin/podman"
+REDHAT_RELEASE_FILE = '/etc/redhat-release'
+OPTS = None
+
+
+logging.basicConfig()
+LOGGER = logging.getLogger(__name__)
+
+
+def parse_options():
+    """
+    >>> import sys
+    >>> sys.argv = ['test', '-c', 'qcore', '-i', 'test']
+    >>> parse_options()
+    Namespace(no_core=False, core='qcore', installed_rpms='test', container_name=None, debug=False, remove_container=False)
+    """
+    global OPTS
+
+    this = sys.argv[0]
+    example_core_file = "./core." + str(os.getpid())
+    example_exec_file = "/usr/sbin/httpd"
+    example_installed_rpms = "./sosreport/installed-rpms"
+    parser = argparse.ArgumentParser(
+        description="Core analysis aid tool to fake up a customer's environment",
+        epilog="Example:\n" + \
+        "  " + this + " -c " + example_core_file + " -i " + example_installed_rpms,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        '-n',
+        '--no-core',
+        action='store_true',
+        help="do not copy the core to the container"
+    )
+    def _exists(path):
+        if not os.path.exists(path):
+            raise argparse.ArgumentTypeError("{0} does not exist".format(path))
+    def _is_file(path):
+        if not os.path.isfile(path):
+            raise argparse.ArgumentTypeError("{0} is not a file".format(path))
+    def _is_readable(path):
+        if not os.access(path, os.R_OK):
+            raise argparse.ArgumentTypeError("{0} is not readable".format(path))
+    def _is_readable_file(path):
+        _exists(path)
+        _is_file(path)
+        _is_readable(path)
+        return path
+    def _is_readable_executable_file(path):
+        _exists(path)
+        _is_file(path)
+        _is_readable(path)
+        if not os.access(path, os.X_OK):
+            raise argparse.ArgumentTypeError("{0} is not executable".format(path))
+        return path
+    parser.add_argument(
+        '-c',
+        '--core',
+        action='store',
+        help="target core file to analyze",
+        type=_is_readable_file,
+        required=True,
+    )
+    parser.add_argument(
+        '-i',
+        '--installed-rpms',
+        action='store',
+        help="text file which contains the list of the installed packages, i.e., the output of `rpm -qa`",
+        type=_is_readable_file,
+        required=True,
+    )
+    parser.add_argument(
+        '--container-name',
+        action='store',
+        help="name of container faking up the customer's environment",
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help=argparse.SUPPRESS # do not show this arg in help
+    )
+    parser.add_argument(
+        '--remove-container',
+        action='store_true',
+        help="remove the container at the end"
+    )
+    return parser.parse_args()
+
+
+def make_working_dir():
+    LOGGER.debug("making working directory: " + WORKDIR)
+    if not os.path.exists(WORKDIR):
+        os.makedirs(WORKDIR)
+
+
+def remove_working_dir():
+    LOGGER.debug("removing working directory: " + WORKDIR)
+    if os.path.exists(WORKDIR):
+        shutil.rmtree(WORKDIR)
+
+
+def open_log():
+    formatter = logging.Formatter('%(asctime)s %(lineno)d %(levelname)s %(message)s')
+    file_log_handler = logging.FileHandler(WORKDIR + '/' + my_name() + '.log')
+    file_log_handler.setFormatter(formatter)
+    file_log_handler.setLevel(logging.DEBUG)
+    LOGGER.addHandler(file_log_handler)
+    
+    stderr_log_handler = logging.StreamHandler(sys.stderr)
+    stderr_log_handler.setFormatter(formatter)
+    stderr_log_handler.setLevel(logging.DEBUG)
+    LOGGER.addHandler(stderr_log_handler)
+    
+    if OPTS.debug:
+        LOGGER.setLevel(logging.DEBUG)
+    else:
+        LOGGER.setLevel(logging.INFO)
+
+
+def get_execfn():
+    """
+    runs `file core`, and parses output to get the command name.
+    """
+    out = subprocess.check_output(["file", OPTS.core]).decode('utf-8')
+    LOGGER.debug("get_libs: out=" + out)
+    for token in out.split(', '):
+        if token.startswith("execfn:"):
+            return token.split()[1][1:-1]
+
+
+def get_libraries(execfn):
+    """
+    runs `gdb -e exec -c core -ex "info sharedlibrary" -ex quit`, and parses output to return libraries.
+    """
+    sysroot = WORKDIR + "/root"
+    local_execfn_path = sysroot + execfn
+    command = ["gdb", "-q",
+               "-ex", "set sysroot " + sysroot,
+               "-ex", "file {0}".format(local_execfn_path),
+               "-ex", "core-file {0}".format(OPTS.core),
+               "-ex", "info sharedlibrary",
+               "-ex", "quit"]
+    LOGGER.debug("get_libs: running " + str(command))
+    #out = container.check_output(command)
+    out = subprocess.check_output(command).decode("utf-8")
+    LOGGER.debug("get_libs: out=" + str(out))
+    #libs, ids = parse_eu_unstrip_output(out)
+    libs = []
+    lines = out.split('\n')
+    while True:
+        l = lines.pop(0)
+        if l.startswith("From"):
+            break
+    while True:
+        l = lines.pop(0)
+        if len(l.split())>0 and l.split()[-1].startswith('/'):
+            libs.append(l.split()[-1])
+        else:
+            break
+    LOGGER.debug("libraries: " + str(libs))
+    return libs
+
+
+def get_dependent_rpms(c, binaries):
+    out = c.check_output(["rpm", "-qf"] + binaries)
+    rpms = list(filter(lambda p: len(p)>0, list(set(out.split('\r\n')))))
+    LOGGER.debug("get_dep_rpms: rpms=" + str(rpms))
+    out = c.check_output(["rpm", "-qi"] + rpms)
+    rpms_no_version = list(
+        map(lambda l: l[13:].rstrip().lstrip(),
+            filter(lambda l: l.startswith("Name        : "), out.split('\r\n'))
+            ))
+    LOGGER.debug("get_dep_rpms: rpms_no_version=" + str(rpms_no_version))
+    return rpms_no_version
+
+
+def get_redhat_release():
+    with open(REDHAT_RELEASE_FILE, mode='r') as f:
+        return f.readline()
+
+
+def is_f3x():
+    if get_redhat_release().startswith('Fedora release 3'):
+        return True
+    else:
+        return False
+
+
+def is_supported_platform():
+    return is_f3x()
+
+
+def die_if_unsupported_platform():
+    if not is_supported_platform():
+        sys.exit("this works only on Fedora 33~")
+
+
+class Container():
+    """
+    container
+    """
+
+    def __init__(self, name, remove=False):
+        self.name = name
+        self.remove = remove
+
+    def __enter__(self):
+        try:
+            subprocess.check_call(
+                [PODMAN, 'login', '--get-login', 'https://registry.redhat.io'],
+                stderr=subprocess.STDOUT
+            )
+        except subprocess.CalledProcessError as e:
+            try:
+                print("Enter Red Hat Customer Portal username/password")
+                subprocess.check_call(
+                    [PODMAN, 'login', 'https://registry.redhat.io'],
+                    stderr=subprocess.STDOUT
+                )
+            except subprocess.CalledProcessError as e1:
+                LOGGER.error(str(e1.stdout))
+                sys.exit(1)
+        subprocess.check_output(
+            [PODMAN, 'run', '-d', '--privileged', '--name', self.name, '-P', 'registry.redhat.io/ubi8/ubi-init:8.0'],
+        )
+        LOGGER.debug("container started")
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self.remove:
+            out = subprocess.check_output(
+                [PODMAN, 'rm', '-f', self.name],
+                stderr=subprocess.STDOUT
+            ).decode('utf-8')
+            LOGGER.debug(out)
+            LOGGER.debug("container removed")
+
+    def push_file(self, src=None, dst="/"):
+        try:
+            subprocess.check_call([PODMAN, 'cp', src, self.name + ":" + dst])
+        except subprocess.CalledProcessError as e:
+            LOGGER.error(str(e.stdout))
+            sys.exit(1)
+
+    def pull_file(self, src=None, dst="."):
+        try:
+            actual_dst = dst
+            if dst.endswith('/'):
+                actual_dst = dst[:-1] + src
+                actual_dst_dir = os.path.dirname(actual_dst)
+                if not os.path.exists(actual_dst_dir):
+                    os.makedirs(actual_dst_dir)
+            subprocess.check_call([PODMAN, 'cp', self.name + ":" + src, actual_dst])
+        except subprocess.CalledProcessError as e:
+            LOGGER.error(str(e.stdout))
+            sys.exit(1)
+
+    def check_output(self, command):
+        try:
+            return subprocess.check_output(
+                [PODMAN, 'exec', '-it', self.name] + command,
+                stderr=subprocess.STDOUT
+            ).decode('utf-8')
+        except subprocess.CalledProcessError as e:
+            LOGGER.error(str(e.stdout))
+            sys.exit(1)
+
+    def exec(self, command):
+        LOGGER.debug("exec command=" + str(command))
+        try:
+            subprocess.check_call([PODMAN, 'exec', '-it', self.name] + command)
+        except subprocess.CalledProcessError as e1:
+            LOGGER.error(e1.stdout.read())
+            sys.exit(1)
+        pass
+
+    def install_rpms(self, installed_rpms_file):
+        with open(installed_rpms_file, "r") as f:
+            rpms = [l.rstrip() for l in f.readlines()]
+            rpms = list(filter(lambda l: not (l.startswith("kernel") and not l.startswith("kernel-tools")), rpms))
+            rpms = list(filter(lambda l: not l.startswith("kmod-libs"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("kmod-kvdo"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("vdo"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("lvm"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("kpatch"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("filesystem"), rpms))
+            rpms = list(filter(lambda l: not l.startswith("gpg-pubkey"), rpms))
+            rpms += ["gdb"]
+            command = ["dnf", "--best", "--allowerasing", "install", "-y"] + rpms
+            LOGGER.debug("command: " + str(command))
+            self.exec(command)
+
+
+def main():
+    make_working_dir()
+    open_log()
+    container_name = CONTAINER_NAME
+    execfn = get_execfn()
+    with Container(container_name, remove=OPTS.remove_container) as c:
+        c.push_file(src=OPTS.core)
+        c.install_rpms(OPTS.installed_rpms)
+        c.pull_file(src=execfn, dst='{0}/root/'.format(WORKDIR))
+        libraries = get_libraries(execfn)
+        dependent_rpms = get_dependent_rpms(c, [execfn] + libraries)
+        c.exec(["dnf", "debuginfo-install", "-y"] + dependent_rpms)
+        c.exec(['gdb', execfn, '/' + os.path.basename(OPTS.core)])
+
+
+if __name__ == "__main__":
+    if os.path.basename(__file__) == "test":
+        import doctest
+        doctest.testmod(verbose=True)
+        sys.exit(0)
+    die_if_unsupported_platform()
+    OPTS = parse_options()
+    main()
