@@ -321,7 +321,7 @@ class Container():
 def main():
     make_working_dir()
     open_log()
-    container_name = CONTAINER_NAME
+    container_name = CONTAINER_NAME if OPTS.container_name == None else OPTS.container_name
     execfn = get_execfn()
     with Container(container_name, remove=OPTS.remove_container) as c:
         c.push_file(src=OPTS.core)
