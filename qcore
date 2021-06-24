@@ -45,7 +45,7 @@ def parse_options():
     >>> import sys
     >>> sys.argv = ['test', '-c', 'qcore', '-i', 'test']
     >>> parse_options()
-    Namespace(no_core=False, core='qcore', installed_rpms='test', container_name=None, debug=False, remove_container=False)
+    Namespace(core='qcore', installed_rpms='test', container_name=None, debug=False, remove_container=False)
     """
     global OPTS
 
@@ -58,12 +58,6 @@ def parse_options():
         epilog="Example:\n" + \
         "  " + this + " -c " + example_core_file + " -i " + example_installed_rpms,
         formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument(
-        '-n',
-        '--no-core',
-        action='store_true',
-        help="do not copy the core to the container"
     )
     def _exists(path):
         if not os.path.exists(path):
