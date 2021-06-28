@@ -16,10 +16,12 @@ A script to create a podman RHEL8 container to run gdb against RHEL8 userspace c
     --container-name CONTAINER_NAME
                           name of container faking up the customer's environment
     --remove-container    remove the container at the end
+    --enable-repository ENABLE_REPOSITORY
+                          enable dnf repository
 
 # Example
 
-    ./qcore -c ./core.357718 -i ./sosreport/installed-rpms
+    ./qcore -c ./core.4866 -i ./sosreport/installed-rpms --container-name qcore-bzXXXXXXXX --enable-repository jb-coreservices-1-for-rhel-8-x86_64-rpms
 
 # Author
 

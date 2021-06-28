@@ -53,10 +53,12 @@ def parse_options():
     example_core_file = "./core." + str(os.getpid())
     example_exec_file = "/usr/sbin/httpd"
     example_installed_rpms = "./sosreport/installed-rpms"
+    example_container_name = my_name() + "-bzXXXXXXXX"
+    example_repository_name = "jb-coreservices-1-for-rhel-8-x86_64-rpms"
     parser = argparse.ArgumentParser(
         description="Core analysis aid tool to fake up a customer's environment",
         epilog="Example:\n" + \
-        "  " + this + " -c " + example_core_file + " -i " + example_installed_rpms,
+        "  " + " ".join([this, "-c", example_core_file, "-i", example_installed_rpms, "--container-name", example_container_name, "--enable-repository", example_repository_name]),
         formatter_class=argparse.RawTextHelpFormatter
     )
     def _exists(path):
@@ -110,6 +112,12 @@ def parse_options():
         '--remove-container',
         action='store_true',
         help="remove the container at the end"
+    )
+    parser.add_argument(
+        '--enable-repository',
+        action='extend',
+        help="enable dnf repository",
+        nargs=1
     )
     return parser.parse_args()
 
@@ -297,12 +305,19 @@ class Container():
         try:
             subprocess.check_call([PODMAN, 'exec', '-it', self.name] + command)
         except subprocess.CalledProcessError as e1:
+            LOGGER.error(e1.stderr.read())
             LOGGER.error(e1.stdout.read())
             sys.exit(1)
         pass
 
     def install_rpms(self, installed_rpms_file):
         with open(installed_rpms_file, "r") as f:
+            for repo in OPTS.enable_repository:
+                command = ["dnf", "config-manager", "-y"]
+                command.append("--enable")
+                command.append(repo)
+                self.exec(command)
+
             rpms = [l.rstrip() for l in f.readlines()]
             rpms = list(filter(lambda l: not (l.startswith("kernel") and not l.startswith("kernel-tools")), rpms))
             rpms = list(filter(lambda l: not l.startswith("kmod-libs"), rpms))
@@ -314,7 +329,6 @@ class Container():
             rpms = list(filter(lambda l: not l.startswith("gpg-pubkey"), rpms))
             rpms += ["gdb"]
             command = ["dnf", "--best", "--allowerasing", "install", "-y"] + rpms
-            LOGGER.debug("command: " + str(command))
             self.exec(command)
 
 
